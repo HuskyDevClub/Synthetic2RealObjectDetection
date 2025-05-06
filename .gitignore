@@ -1,0 +1,5 @@
+/testImages
+/train
+/val
+sample_submission.csv
+coordinate_prediction_model.pt
