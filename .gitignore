@@ -1,6 +1,9 @@
+/Kaggle2StartingDataset
+/__pycache__
 /testImages
 /train
 /val
 sample_submission.csv
-coordinate_prediction_model.pt
-/__pycache__
+training_progress.png
+/annotated_real_data
+checkpoint.pt
