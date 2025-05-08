@@ -3,3 +3,4 @@
 /val
 sample_submission.csv
 coordinate_prediction_model.pt
+/__pycache__
