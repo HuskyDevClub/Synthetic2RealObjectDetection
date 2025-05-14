@@ -105,7 +105,7 @@ class CoordinateDataset(Dataset):
             except Exception as e:
                 print(f"Error reading {label_path}: {e}")
                 return None
-        return torch.tensor(coords, dtype=torch.float32)
+        return torch.tensor(coords[1:], dtype=torch.float32)
 
     def __len__(self) -> int:
         return len(self.__img_files)
@@ -123,9 +123,7 @@ class CoordinateDataset(Dataset):
 
 # Define a simple CNN model for coordinate prediction
 class CoordinateCNN(nn.Module):
-    def __init__(
-        self, num_coords: int = 5
-    ) -> None:  # Default: class_id + 4 coordinates
+    def __init__(self, num_coords: int = 4) -> None:  # Default: 4 coordinates
         super(CoordinateCNN, self).__init__()
 
         self.features = nn.Sequential(
@@ -483,7 +481,7 @@ def visualize_prediction(
     h, w = transformed_image.shape[1:]  # Height and width after transformation
 
     # Draw predicted bounding box (red)
-    pred_class, pred_x, pred_y, pred_w, pred_h = pred_coords.cpu().numpy()
+    pred_x, pred_y, pred_w, pred_h = pred_coords.cpu().numpy()
     pred_x1 = int((pred_x - pred_w / 2) * w)
     pred_y1 = int((pred_y - pred_h / 2) * h)
     pred_x2 = int((pred_x + pred_w / 2) * w)
@@ -499,7 +497,7 @@ def visualize_prediction(
     # Draw true bounding box (green) if provided
     if true_coords is not None:
         true_coords = true_coords.to(device)  # Move to same device if provided
-        true_class, true_x, true_y, true_w, true_h = true_coords.cpu().numpy()
+        true_x, true_y, true_w, true_h = true_coords.cpu().numpy()
         true_x1 = int((true_x - true_w / 2) * w)
         true_y1 = int((true_y - true_h / 2) * h)
         true_x2 = int((true_x + true_w / 2) * w)
@@ -511,11 +509,6 @@ def visualize_prediction(
             linewidth=2,
             label="Ground Truth",
         )
-        plt.title(
-            f"True class: {int(true_class)}, Pred class: {int(round(pred_class))}"
-        )
-    else:
-        plt.title(f"Predicted class: {int(round(pred_class))}")
 
     plt.legend()
     plt.show()
