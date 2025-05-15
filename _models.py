@@ -39,7 +39,16 @@ def get_all_images_pathlib(folder_path: str) -> list[str]:
 
 class CoordinateDataset(Dataset):
 
-    def __init__(self, dataset_dir: str, transform: transforms.Compose = None):
+    # Define transformations (without normalization for images)
+    TRANSFORM: transforms.Compose = transforms.Compose(
+        [
+            transforms.Grayscale(num_output_channels=1),
+            transforms.Resize((512, 512)),
+            transforms.ToTensor(),
+        ]
+    )
+
+    def __init__(self, dataset_dir: str):
         """
         Args:
             img_dir (string): Directory with all the images
@@ -47,7 +56,6 @@ class CoordinateDataset(Dataset):
             transform (callable, optional): Optional transform to be applied on images
         """
         self.__dataset_dir: str = dataset_dir
-        self.__transform: transforms.Compose = transform
 
         # Get sorted list of files to ensure proper pairing
         self.__img_files: list[str] = get_all_images_pathlib(self.__dataset_dir)
@@ -111,14 +119,10 @@ class CoordinateDataset(Dataset):
         return len(self.__img_files)
 
     def __getitem__(self, idx: int) -> tuple[PILImage.Image, torch.Tensor]:
-        # Load image
-        image: PILImage.Image = PILImage.open(self.__img_files[idx]).convert("RGB")
-
-        # Apply transformations if any
-        if self.__transform:
-            image = self.__transform(image)
-
-        return image, self.__coords[idx]
+        return (
+            self.TRANSFORM(PILImage.open(self.__img_files[idx]).convert("RGB")),
+            self.__coords[idx],
+        )
 
 
 # Define a simple CNN model for coordinate prediction
@@ -127,19 +131,26 @@ class CoordinateCNN(nn.Module):
         super(CoordinateCNN, self).__init__()
 
         self.features = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1),
+            # First block - 32 filters
+            nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2, stride=2),
+            # Second block - 64 filters
             nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            # Third block - 128 filters
+            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            # Fourth block - 256 filters
+            nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=2, stride=2),
         )
         self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(64 * 32 * 32, 512),  # Adjust based on your input image size
+            nn.Linear(256 * 32 * 32, 512),  # Adjust based on your input image size
             nn.ReLU(inplace=True),
             nn.Dropout(0.5),
             nn.Linear(512, 128),
@@ -445,7 +456,6 @@ def plot_training_history(history: dict):
 def visualize_prediction(
     image_path: str,
     model: torch.nn.Module,
-    transform: transforms.Compose,
     true_coords: torch.Tensor = None,
 ) -> None:
     # Load and transform the image
@@ -453,7 +463,7 @@ def visualize_prediction(
     original_width, original_height = image.size
 
     # Transform the image
-    transformed_image = transform(image)
+    transformed_image = CoordinateDataset.TRANSFORM(image)
 
     # Get model device
     device = next(model.parameters()).device
