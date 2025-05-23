@@ -77,7 +77,7 @@ class CoordinateDataset(Dataset):
             coords: torch.Tensor | None = self.load_coordinates(label_path)
             # Remove image if label is invalid
             if coords is None:
-                self.__img_files.pop(i)
+                os.remove(self.__img_files.pop(i))
             else:
                 self.__coords.append(coords)
         self.__coords.reverse()
@@ -452,6 +452,23 @@ def plot_training_history(history: dict):
     plt.show()
 
 
+def plot_coordinates(
+    coords: torch.Tensor, w: int, h: int, label: str, color: str
+) -> None:
+    true_x, true_y, true_w, true_h = coords.cpu().numpy()
+    true_x1 = int((true_x - true_w / 2) * w)
+    true_y1 = int((true_y - true_h / 2) * h)
+    true_x2 = int((true_x + true_w / 2) * w)
+    true_y2 = int((true_y + true_h / 2) * h)
+    plt.plot(
+        [true_x1, true_x2, true_x2, true_x1, true_x1],
+        [true_y1, true_y1, true_y2, true_y2, true_y1],
+        color=color,
+        linewidth=2,
+        label=label,
+    )
+
+
 # Visualization of predictions
 def visualize_prediction(
     image_path: str,
@@ -491,34 +508,12 @@ def visualize_prediction(
     h, w = transformed_image.shape[1:]  # Height and width after transformation
 
     # Draw predicted bounding box (red)
-    pred_x, pred_y, pred_w, pred_h = pred_coords.cpu().numpy()
-    pred_x1 = int((pred_x - pred_w / 2) * w)
-    pred_y1 = int((pred_y - pred_h / 2) * h)
-    pred_x2 = int((pred_x + pred_w / 2) * w)
-    pred_y2 = int((pred_y + pred_h / 2) * h)
-    plt.plot(
-        [pred_x1, pred_x2, pred_x2, pred_x1, pred_x1],
-        [pred_y1, pred_y1, pred_y2, pred_y2, pred_y1],
-        "r-",
-        linewidth=2,
-        label="Prediction",
-    )
+    plot_coordinates(pred_coords, w, h, label="Prediction", color="red")
 
     # Draw true bounding box (green) if provided
     if true_coords is not None:
         true_coords = true_coords.to(device)  # Move to same device if provided
-        true_x, true_y, true_w, true_h = true_coords.cpu().numpy()
-        true_x1 = int((true_x - true_w / 2) * w)
-        true_y1 = int((true_y - true_h / 2) * h)
-        true_x2 = int((true_x + true_w / 2) * w)
-        true_y2 = int((true_y + true_h / 2) * h)
-        plt.plot(
-            [true_x1, true_x2, true_x2, true_x1, true_x1],
-            [true_y1, true_y1, true_y2, true_y2, true_y1],
-            "g-",
-            linewidth=2,
-            label="Ground Truth",
-        )
+        plot_coordinates(true_coords, w, h, label="True", color="green")
 
     plt.legend()
     plt.show()
