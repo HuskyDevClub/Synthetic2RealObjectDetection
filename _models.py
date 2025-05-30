@@ -1,5 +1,4 @@
 import os
-import time
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -7,7 +6,8 @@ import numpy as np
 import torch
 from PIL import Image as PILImage
 from torch import nn
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset
+from torchmetrics.detection import MeanAveragePrecision
 from torchvision import transforms
 from tqdm import tqdm
 
@@ -39,11 +39,13 @@ def get_all_images_pathlib(folder_path: str) -> list[str]:
 
 class CoordinateDataset(Dataset):
 
+    SIZE: tuple[int, int] = (512, 512)  # Size of the images
+
     # Define transformations (without normalization for images)
     TRANSFORM: transforms.Compose = transforms.Compose(
         [
             transforms.Grayscale(num_output_channels=1),
-            transforms.Resize((512, 512)),
+            transforms.Resize(SIZE),
             transforms.ToTensor(),
         ]
     )
@@ -58,17 +60,15 @@ class CoordinateDataset(Dataset):
         self.__dataset_dir: str = dataset_dir
 
         # Get sorted list of files to ensure proper pairing
-        self.__img_files: list[str] = get_all_images_pathlib(self.__dataset_dir)
+        img_files: list[str] = get_all_images_pathlib(self.__dataset_dir)
 
         # Load coordinates from label files
         self.__coords: list[torch.Tensor] = []
-        for i in range(len(self.__img_files) - 1, -1, -1):
+        for i in range(len(img_files) - 1, -1, -1):
             # Get corresponding label path (replace image extension with .txt)
-            label_name = (
-                os.path.splitext(os.path.basename(self.__img_files[i]))[0] + ".txt"
-            )
+            label_name = os.path.splitext(os.path.basename(img_files[i]))[0] + ".txt"
             label_path = os.path.join(
-                os.path.dirname(os.path.dirname(self.__img_files[i])),
+                os.path.dirname(os.path.dirname(img_files[i])),
                 "labels",
                 label_name,
             )
@@ -77,15 +77,16 @@ class CoordinateDataset(Dataset):
             coords: torch.Tensor | None = self.load_coordinates(label_path)
             # Remove image if label is invalid
             if coords is None:
-                os.remove(self.__img_files.pop(i))
+                os.remove(img_files.pop(i))
             else:
                 self.__coords.append(coords)
         self.__coords.reverse()
 
-        # print(self.__img_files[-1])
-        # print(self.__getitem__(-1))
+        assert len(img_files) == len(self.__coords)
 
-        assert len(self.__img_files) == len(self.__coords)
+        self.__images: list[PILImage.Image] = [
+            PILImage.open(f).convert("L").resize(self.SIZE) for f in img_files
+        ]
 
     @staticmethod
     def load_coordinates(label_path: str) -> torch.Tensor | None:
@@ -116,18 +117,15 @@ class CoordinateDataset(Dataset):
         return torch.tensor(coords[1:], dtype=torch.float32)
 
     def __len__(self) -> int:
-        return len(self.__img_files)
+        return len(self.__images)
 
     def __getitem__(self, idx: int) -> tuple[PILImage.Image, torch.Tensor]:
-        return (
-            self.TRANSFORM(PILImage.open(self.__img_files[idx]).convert("RGB")),
-            self.__coords[idx],
-        )
+        return self.TRANSFORM(self.__images[idx]), self.__coords[idx]
 
 
-# Define a simple CNN model for coordinate prediction
+# A simple CNN model for coordinate prediction
 class CoordinateCNN(nn.Module):
-    def __init__(self, num_coords: int = 4) -> None:  # Default: 4 coordinates
+    def __init__(self, num_coords: int = 4) -> None:
         super(CoordinateCNN, self).__init__()
 
         self.features = nn.Sequential(
@@ -148,17 +146,23 @@ class CoordinateCNN(nn.Module):
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=2, stride=2),
         )
+
         self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(256 * 32 * 32, 512),  # Adjust based on your input image size
+            nn.Linear(256 * 32 * 32, 512),
             nn.ReLU(inplace=True),
             nn.Dropout(0.5),
             nn.Linear(512, 128),
             nn.ReLU(inplace=True),
-            nn.Linear(128, num_coords),
         )
 
-        # Initialize weights using He initialization
+        # Separate heads for coordinates and confidence
+        self.coord_head = nn.Linear(128, num_coords)
+        self.conf_head = nn.Sequential(
+            nn.Linear(128, 1), nn.Sigmoid()  # Confidence between 0 and 1
+        )
+
+        # Initialize weights
         self._initialize_weights()
 
     def _initialize_weights(self):
@@ -177,13 +181,93 @@ class CoordinateCNN(nn.Module):
     def forward(self, x):
         x = self.features(x)
         x = self.classifier(x)
-        return x
+
+        coords = self.coord_head(x)
+        confidence = self.conf_head(x)
+
+        return coords, confidence
+
+
+# Modified loss function that includes confidence
+class DetectionLoss(nn.Module):
+    def __init__(self, coord_weight=1.0, conf_weight=1.0):
+        super(DetectionLoss, self).__init__()
+        self.coord_weight = coord_weight
+        self.conf_weight = conf_weight
+        self.mse_loss = nn.MSELoss()
+        self.bce_loss = nn.BCELoss()
+
+    def forward(self, pred_coords, pred_conf, true_coords, target_conf=None):
+        # Coordinate loss
+        coord_loss = self.mse_loss(pred_coords, true_coords)
+
+        # If target confidence not provided, calculate based on IoU
+        if target_conf is None:
+            with torch.no_grad():
+                # Calculate IoU between predicted and true boxes
+                target_conf = self.calculate_iou_confidence(pred_coords, true_coords)
+
+        # Confidence loss
+        conf_loss = self.bce_loss(pred_conf, target_conf)
+
+        # Combined loss
+        total_loss = self.coord_weight * coord_loss + self.conf_weight * conf_loss
+
+        return total_loss, coord_loss, conf_loss
+
+    def calculate_iou_confidence(self, pred_coords, true_coords):
+        """Calculate IoU-based confidence targets"""
+        batch_size = pred_coords.shape[0]
+        ious = []
+
+        for i in range(batch_size):
+            # Convert center format to corner format
+            pred = pred_coords[i]
+            true = true_coords[i]
+
+            # Calculate IoU (simplified version)
+            # You can use the more detailed IoU calculation from your existing code
+            iou = self.calculate_single_iou(pred, true)
+            ious.append(iou)
+
+        return torch.tensor(ious, device=pred_coords.device).unsqueeze(1)
+
+    def calculate_single_iou(self, pred, true):
+        """Simplified IoU calculation for single box pair"""
+        # Convert from center format to corner format
+        pred_x1 = pred[0] - pred[2] / 2
+        pred_y1 = pred[1] - pred[3] / 2
+        pred_x2 = pred[0] + pred[2] / 2
+        pred_y2 = pred[1] + pred[3] / 2
+
+        true_x1 = true[0] - true[2] / 2
+        true_y1 = true[1] - true[3] / 2
+        true_x2 = true[0] + true[2] / 2
+        true_y2 = true[1] + true[3] / 2
+
+        # Calculate intersection
+        x1 = max(pred_x1, true_x1)
+        y1 = max(pred_y1, true_y1)
+        x2 = min(pred_x2, true_x2)
+        y2 = min(pred_y2, true_y2)
+
+        intersection = max(0, x2 - x1) * max(0, y2 - y1)
+
+        # Calculate union
+        pred_area = (pred_x2 - pred_x1) * (pred_y2 - pred_y1)
+        true_area = (true_x2 - true_x1) * (true_y2 - true_y1)
+        union = pred_area + true_area - intersection
+
+        # Calculate IoU
+        iou = intersection / (union + 1e-6)
+
+        return iou.item()
 
 
 class EarlyStopping:
     """Early stops the training if validation loss doesn't improve after a given patience."""
 
-    def __init__(self, patience=7, verbose=False, delta=0, path="checkpoint.pt"):
+    def __init__(self, patience=7, verbose=False, delta=0, path="models/checkpoint.pt"):
         """
         Args:
             patience (int): How long to wait after last time validation loss improved.
@@ -193,7 +277,7 @@ class EarlyStopping:
             delta (float): Minimum change in the monitored quantity to qualify as an improvement.
                             Default: 0
             path (str): Path for the checkpoint to be saved to.
-                            Default: 'checkpoint.pt'
+                            Default: 'models/checkpoint.pt'
         """
         self.patience = patience
         self.verbose = verbose
@@ -230,48 +314,69 @@ class EarlyStopping:
         self.val_loss_min = val_loss
 
 
-def create_data_loaders(
-    full_dataset: CoordinateDataset,
-    batch_size=32,
-    test_size=0.2,
-    val_size=0.1,
-    random_state=42,
-) -> tuple[DataLoader, DataLoader, DataLoader]:
-    # Calculate sizes
-    test_count: int = int(test_size * len(full_dataset))
-    train_val_count: int = len(full_dataset) - test_count
-    val_count: int = int(val_size * train_val_count)
-    train_count: int = train_val_count - val_count
+def convert_to_detection_format(
+    coords: torch.Tensor, image_size: tuple[int, int] = (512, 512)
+) -> dict:
+    """
+    Convert normalized coordinates to detection format for torchmetrics.
 
-    # Split the dataset
-    train_dataset, test_dataset = random_split(
-        full_dataset,
-        [train_val_count, test_count],
-        generator=torch.Generator().manual_seed(random_state),
-    )
+    Args:
+        coords: Tensor of shape [batch_size, 4] with normalized coords (x_center, y_center, width, height)
+        image_size: (height, width) of images
 
-    train_dataset, val_dataset = random_split(
-        train_dataset,
-        [train_count, val_count],
-        generator=torch.Generator().manual_seed(random_state),
-    )
+    Returns:
+        Dictionary with boxes, scores, and labels in the format expected by torchmetrics
+    """
+    batch_size = coords.shape[0]
+    h, w = image_size
 
-    # Create data loaders
-    train_loader: DataLoader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True, num_workers=4
-    )
-    val_loader: DataLoader = DataLoader(
-        val_dataset, batch_size=batch_size, shuffle=False, num_workers=4
-    )
-    test_loader: DataLoader = DataLoader(
-        test_dataset, batch_size=batch_size, shuffle=False, num_workers=4
-    )
+    # Convert from normalized center format to absolute corner format
+    x_center = coords[:, 0] * w
+    y_center = coords[:, 1] * h
+    width = coords[:, 2] * w
+    height = coords[:, 3] * h
 
-    print(
-        f"Dataset split: Train={len(train_dataset)}, Validation={len(val_dataset)}, Test={len(test_dataset)}"
-    )
+    # Convert to corner format (x1, y1, x2, y2)
+    x1 = x_center - width / 2
+    y1 = y_center - height / 2
+    x2 = x_center + width / 2
+    y2 = y_center + height / 2
 
-    return train_loader, val_loader, test_loader
+    # Stack to create boxes tensor
+    boxes = torch.stack([x1, y1, x2, y2], dim=1)
+
+    # Create scores (all 1.0 for ground truth, can be model confidence for predictions)
+    scores = torch.ones(batch_size)
+
+    # Create labels (assuming single class detection, label=0)
+    labels = torch.zeros(batch_size, dtype=torch.int)
+
+    return {"boxes": boxes, "scores": scores, "labels": labels}
+
+
+def convert_to_detection_format_with_confidence(
+    coords: torch.Tensor, confidence: float, image_size: tuple[int, int] = (512, 512)
+) -> dict:
+    """Convert predictions to detection format with confidence scores"""
+    h, w = image_size
+
+    # Convert from normalized center format to absolute corner format
+    x_center = coords[0, 0] * w
+    y_center = coords[0, 1] * h
+    width = coords[0, 2] * w
+    height = coords[0, 3] * h
+
+    # Convert to corner format
+    x1 = x_center - width / 2
+    y1 = y_center - height / 2
+    x2 = x_center + width / 2
+    y2 = y_center + height / 2
+
+    boxes = torch.tensor([[x1, y1, x2, y2]])
+    scores = torch.tensor([confidence])
+    labels = torch.tensor([0], dtype=torch.int)
+
+    return {"boxes": boxes, "scores": scores, "labels": labels}
 
 
 def train_and_validate(
@@ -284,64 +389,74 @@ def train_and_validate(
     num_epochs: int = 30,
     patience: int = 7,
 ) -> dict:
-    """
-    Train the model with validation and early stopping.
+    """Train model with confidence scores"""
 
-    Args:
-        device (torch.device): Device to train on
-        model (CoordinateCNN): Model to train
-        train_loader (DataLoader): Training data loader
-        val_loader (DataLoader): Validation data loader
-        criterion: Loss function
-        optimizer: Optimizer
-        num_epochs (int): Maximum number of epochs
-        patience (int): Early stopping patience
+    best_map50 = 0.0
+    patience_counter = 0
+    best_model_state = None
 
-    Returns:
-        dict: Training history
-    """
-    # Initialize early stopping
-    early_stopping = EarlyStopping(patience=patience, verbose=True)
-
-    # Initialize history dictionary to store metrics
-    history = {"train_loss": [], "val_loss": [], "epochs": []}
-
-    # Start training
-    start_time = time.time()
+    history = {
+        "train_loss": [],
+        "train_coord_loss": [],
+        "train_conf_loss": [],
+        "val_loss": [],
+        "val_coord_loss": [],
+        "val_conf_loss": [],
+        "val_map": [],
+        "val_map50": [],
+        "val_map75": [],
+        "epochs": [],
+    }
 
     for epoch in range(num_epochs):
         # Training phase
         model.train()
         train_loss = 0.0
+        train_coord_loss = 0.0
+        train_conf_loss = 0.0
 
-        # Use tqdm for progress bar
         train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]")
 
         for images, coords in train_pbar:
             images = images.to(device)
             coords = coords.to(device)
 
-            # Zero the parameter gradients
             optimizer.zero_grad()
 
-            # Forward pass
-            outputs = model(images)
-            loss = criterion(outputs, coords)
+            # Forward pass - now returns coords and confidence
+            pred_coords, pred_conf = model(images)
 
-            # Backward pass and optimize
+            # Calculate loss
+            loss, coord_loss, conf_loss = criterion(pred_coords, pred_conf, coords)
+
             loss.backward()
             optimizer.step()
 
             # Update statistics
             train_loss += loss.item() * images.size(0)
-            train_pbar.set_postfix({"loss": loss.item()})
+            train_coord_loss += coord_loss.item() * images.size(0)
+            train_conf_loss += conf_loss.item() * images.size(0)
 
-        # Calculate average training loss
+            train_pbar.set_postfix(
+                {
+                    "loss": loss.item(),
+                    "coord": coord_loss.item(),
+                    "conf": conf_loss.item(),
+                }
+            )
+
+        # Calculate averages
         train_loss = train_loss / len(train_loader.dataset)
+        train_coord_loss = train_coord_loss / len(train_loader.dataset)
+        train_conf_loss = train_conf_loss / len(train_loader.dataset)
 
         # Validation phase
         model.eval()
         val_loss = 0.0
+        val_coord_loss = 0.0
+        val_conf_loss = 0.0
+
+        val_metric = MeanAveragePrecision(iou_thresholds=[0.5, 0.75])
 
         with torch.no_grad():
             val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Val]")
@@ -351,103 +466,190 @@ def train_and_validate(
                 coords = coords.to(device)
 
                 # Forward pass
-                outputs = model(images)
-                loss = criterion(outputs, coords)
+                pred_coords, pred_conf = model(images)
+                loss, coord_loss, conf_loss = criterion(pred_coords, pred_conf, coords)
 
                 # Update statistics
                 val_loss += loss.item() * images.size(0)
-                val_pbar.set_postfix({"loss": loss.item()})
+                val_coord_loss += coord_loss.item() * images.size(0)
+                val_conf_loss += conf_loss.item() * images.size(0)
 
-        # Calculate average validation loss
+                # Convert to detection format with confidence scores
+                batch_size = images.size(0)
+                preds = []
+                targets = []
+
+                for i in range(batch_size):
+                    # For predictions, use the model's confidence
+                    pred_dict = convert_to_detection_format_with_confidence(
+                        pred_coords[i : i + 1].cpu(),
+                        pred_conf[i : i + 1].cpu().squeeze(),
+                        CoordinateDataset.SIZE,
+                    )
+                    # For targets, use confidence of 1.0
+                    target_dict = convert_to_detection_format(
+                        coords[i : i + 1].cpu(), CoordinateDataset.SIZE
+                    )
+
+                    preds.append(pred_dict)
+                    targets.append(target_dict)
+
+                val_metric.update(preds, targets)
+
+                val_pbar.set_postfix(
+                    {
+                        "loss": loss.item(),
+                        "coord": coord_loss.item(),
+                        "conf": conf_loss.item(),
+                    }
+                )
+
+        # Calculate averages
         val_loss = val_loss / len(val_loader.dataset)
+        val_coord_loss = val_coord_loss / len(val_loader.dataset)
+        val_conf_loss = val_conf_loss / len(val_loader.dataset)
+
+        # Calculate mAP metrics
+        val_results = val_metric.compute()
+        val_map = val_results["map"].item() * 100
+        val_map50 = val_results["map_50"].item() * 100
+        val_map75 = val_results["map_75"].item() * 100
 
         # Update history
         history["train_loss"].append(train_loss)
+        history["train_coord_loss"].append(train_coord_loss)
+        history["train_conf_loss"].append(train_conf_loss)
         history["val_loss"].append(val_loss)
+        history["val_coord_loss"].append(val_coord_loss)
+        history["val_conf_loss"].append(val_conf_loss)
+        history["val_map"].append(val_map)
+        history["val_map50"].append(val_map50)
+        history["val_map75"].append(val_map75)
         history["epochs"].append(epoch + 1)
 
         # Print epoch summary
         print(
             f"Epoch {epoch+1}/{num_epochs} - "
-            f"Train Loss: {train_loss:.6f}, "
-            f"Val Loss: {val_loss:.6f}"
+            f"Train Loss: {train_loss:.6f} (coord: {train_coord_loss:.6f}, conf: {train_conf_loss:.6f}), "
+            f"Val Loss: {val_loss:.6f} (coord: {val_coord_loss:.6f}, conf: {val_conf_loss:.6f}), "
+            f"Val mAP50: {val_map50:.2f}%"
         )
 
         # Early stopping
-        early_stopping(val_loss, model)
-        if early_stopping.early_stop:
-            print(f"Early stopping triggered after {epoch+1} epochs!")
-            break
+        if val_map50 > best_map50:
+            best_map50 = val_map50
+            patience_counter = 0
+            best_model_state = model.state_dict().copy()
+            torch.save(best_model_state, "models/checkpoint.pt")
+            print(f"New best mAP50: {best_map50:.2f}% - Model saved!")
+        else:
+            patience_counter += 1
+            print(f"No improvement in mAP50. Patience: {patience_counter}/{patience}")
 
-    # Calculate total training time
-    training_time = time.time() - start_time
-    print(f"Training completed in {training_time:.2f} seconds")
+            if patience_counter >= patience:
+                print(f"Early stopping triggered after {epoch+1} epochs!")
+                break
 
-    # Load the best model
-    model.load_state_dict(torch.load("checkpoint.pt"))
+    # Load best model
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
 
     return history
 
 
-def evaluate_model(
-    device: torch.device, model: CoordinateCNN, test_loader: DataLoader, criterion
-):
+def evaluate_model_map(
+    model, data_loader, device, image_size: tuple[int, int] = (512, 512)
+) -> dict:
     """
-    Evaluate the model on the test set.
+    Evaluate model and return detailed mAP metrics.
 
     Args:
-        device (torch.device): Device to evaluate on
-        model (CoordinateCNN): Model to evaluate
-        test_loader (DataLoader): Test data loader
-        criterion: Loss function
+        model: Trained model
+        data_loader: DataLoader for evaluation
+        device: Device to run evaluation on
+        image_size: Image dimensions for mAP calculation
 
     Returns:
-        float: Test loss
+        Dictionary with evaluation metrics
     """
     model.eval()
-    test_loss = 0.0
+
+    # Initialize metric
+    metric = MeanAveragePrecision(iou_thresholds=[0.5, 0.75])
 
     with torch.no_grad():
-        test_pbar = tqdm(test_loader, desc="Testing")
-
-        for images, coords in test_pbar:
+        for images, coords in tqdm(data_loader, desc="Evaluating"):
             images = images.to(device)
             coords = coords.to(device)
 
-            # Forward pass
-            outputs = model(images)
-            loss = criterion(outputs, coords)
+            pred_coords, _ = model(images)
 
-            # Update statistics
-            test_loss += loss.item() * images.size(0)
-            test_pbar.set_postfix({"loss": loss.item()})
+            # Convert to detection format
+            batch_size = images.size(0)
+            preds = []
+            targets = []
 
-    # Calculate average test loss
-    test_loss = test_loss / len(test_loader.dataset)
-    print(f"Test Loss: {test_loss:.6f}")
+            for i in range(batch_size):
+                pred_dict = convert_to_detection_format(
+                    pred_coords[i : i + 1].cpu(), image_size
+                )
+                target_dict = convert_to_detection_format(
+                    coords[i : i + 1].cpu(), image_size
+                )
+                preds.append(pred_dict)
+                targets.append(target_dict)
 
-    return test_loss
+            metric.update(preds, targets)
+
+    # Compute final metrics
+    results = metric.compute()
+
+    metrics = {
+        "mAP": results["map"].item() * 100,
+        "mAP50": results["map_50"].item() * 100,
+        "mAP75": results["map_75"].item() * 100,
+        "mAR@1": results["mar_1"].item() * 100,
+        "mAR@10": results["mar_10"].item() * 100,
+        "mAR@100": results["mar_100"].item() * 100,
+        "total_samples": len(data_loader.dataset),
+    }
+
+    return metrics
 
 
 def plot_training_history(history: dict):
     """
-    Plot the training and validation loss.
+    Plot the training and validation loss with mAP metrics.
 
     Args:
         history (dict): Training history
     """
-    plt.figure(figsize=(10, 6))
-    plt.plot(
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+
+    # Plot losses
+    ax1.plot(
         history["epochs"], history["train_loss"], label="Training Loss", marker="o"
     )
-    plt.plot(
+    ax1.plot(
         history["epochs"], history["val_loss"], label="Validation Loss", marker="x"
     )
-    plt.title("Training and Validation MSE Loss")
-    plt.xlabel("Epochs")
-    plt.ylabel("Loss")
-    plt.legend()
-    plt.grid(True)
+    ax1.set_title("Training and Validation MSE Loss")
+    ax1.set_xlabel("Epochs")
+    ax1.set_ylabel("Loss")
+    ax1.legend()
+    ax1.grid(True)
+
+    # Plot mAP metrics
+    ax2.plot(history["epochs"], history["val_map"], label="mAP", marker="o")
+    ax2.plot(history["epochs"], history["val_map50"], label="mAP@50", marker="x")
+    ax2.plot(history["epochs"], history["val_map75"], label="mAP@75", marker="s")
+    ax2.set_title("Validation mAP Metrics")
+    ax2.set_xlabel("Epochs")
+    ax2.set_ylabel("mAP (%)")
+    ax2.legend()
+    ax2.grid(True)
+
+    plt.tight_layout()
     plt.savefig("training_progress.png")
     plt.show()
 
@@ -497,7 +699,8 @@ def visualize_prediction(
         input_image = transformed_image.unsqueeze(0)
 
         # Get prediction
-        pred_coords = model(input_image)[0]  # Get first item from batch
+        pred_coords, pred_conf = model(input_image)  # Get first item from batch
+        pred_coords = pred_coords.cpu()[0]  # Move to CPU for visualization
 
     # Convert image tensor to numpy for visualization (move back to CPU first)
     img = transformed_image.cpu().permute(1, 2, 0).numpy()
@@ -509,6 +712,7 @@ def visualize_prediction(
 
     # Draw predicted bounding box (red)
     plot_coordinates(pred_coords, w, h, label="Prediction", color="red")
+    plt.title("Confidence: {:.2f}".format(pred_conf.cpu().numpy()[0][0]))
 
     # Draw true bounding box (green) if provided
     if true_coords is not None:
@@ -523,3 +727,39 @@ def visualize_prediction(
         "original_size": (original_width, original_height),
         "prediction": pred_coords.cpu().numpy(),
     }
+
+
+# Visualization of predictions
+def prediction_as_YOLO(
+    image_path: str,
+    model: torch.nn.Module,
+) -> np.ndarray:
+    # Load and transform the image
+    image = PILImage.open(image_path).convert("L")
+
+    # Transform the image
+    transformed_image = CoordinateDataset.TRANSFORM(image)
+
+    # Get model device
+    device = next(model.parameters()).device
+
+    # Move input tensor to the same device as model
+    transformed_image = transformed_image.to(device)
+
+    # Ensure model is in evaluation mode
+    model.eval()
+
+    # Get prediction from model
+    with torch.no_grad():
+        # Add batch dimension
+        input_image = transformed_image.unsqueeze(0)
+
+        # Get prediction
+        result = model(input_image)
+        pred_coords = result[0]
+        confidence = result[1].cpu().numpy()[0, 0]
+
+    x_center, y_center, width, height = pred_coords.cpu().numpy()[0]
+
+    # Return original image dimensions and prediction for reference
+    return confidence, x_center, y_center, width, height

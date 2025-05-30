@@ -6,4 +6,6 @@
 sample_submission.csv
 training_progress.png
 /annotated_real_data
-checkpoint.pt
+/models
+main.py
+my_submission.csv
