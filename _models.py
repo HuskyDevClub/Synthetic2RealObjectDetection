@@ -582,7 +582,8 @@ def evaluate_model_map(
             images = images.to(device)
             coords = coords.to(device)
 
-            pred_coords, _ = model(images)
+            # FIXED: Get BOTH coordinates and confidence scores
+            pred_coords, pred_conf = model(images)
 
             # Convert to detection format
             batch_size = images.size(0)
@@ -590,8 +591,11 @@ def evaluate_model_map(
             targets = []
 
             for i in range(batch_size):
-                pred_dict = convert_to_detection_format(
-                    pred_coords[i : i + 1].cpu(), image_size
+                # FIXED: Use the model's confidence scores for predictions
+                pred_dict = convert_to_detection_format_with_confidence(
+                    pred_coords[i : i + 1].cpu(),
+                    pred_conf[i : i + 1].cpu().squeeze(),
+                    image_size,
                 )
                 target_dict = convert_to_detection_format(
                     coords[i : i + 1].cpu(), image_size
