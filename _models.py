@@ -39,16 +39,25 @@ def get_all_images_pathlib(folder_path: str) -> list[str]:
 
 class CoordinateDataset(Dataset):
 
-    SIZE: tuple[int, int] = (512, 512)  # Size of the images
+    # SIZE: tuple[int, int] = (512, 512)  # Size of the images
+    SIZE: tuple[int, int] = (256, 256)  # Size of the images
+
+    # Define the transformation sequence
+    __TRANSFORM_SEQUENCE: list = [
+        transforms.Resize(SIZE),
+        transforms.ToTensor(),
+    ]
+
+    # If RGB is disabled, convert to Grayscale
+    ENABLE_RGB: bool = True  # Use RGB images if True, Grayscale if False
+    if not ENABLE_RGB:
+        __TRANSFORM_SEQUENCE.insert(0, transforms.Grayscale(num_output_channels=1))
+
+    # Train with transforms
+    ENABLE_TRANSFORM_TRAIN: bool = True
 
     # Define transformations (without normalization for images)
-    TRANSFORM: transforms.Compose = transforms.Compose(
-        [
-            transforms.Grayscale(num_output_channels=1),
-            transforms.Resize(SIZE),
-            transforms.ToTensor(),
-        ]
-    )
+    TRANSFORM: transforms.Compose = transforms.Compose(__TRANSFORM_SEQUENCE)
 
     def __init__(self, dataset_dir: str):
         """
@@ -60,7 +69,12 @@ class CoordinateDataset(Dataset):
         self.__dataset_dir: str = dataset_dir
 
         # Get sorted list of files to ensure proper pairing
-        img_files: list[str] = get_all_images_pathlib(self.__dataset_dir)
+        img_files: list[str] = list(
+            filter(
+                lambda f: self.ENABLE_TRANSFORM_TRAIN or "_transform_" not in f,
+                get_all_images_pathlib(self.__dataset_dir),
+            )
+        )
 
         # Load coordinates from label files
         self.__coords: list[torch.Tensor] = []
@@ -85,7 +99,10 @@ class CoordinateDataset(Dataset):
         assert len(img_files) == len(self.__coords)
 
         self.__images: list[PILImage.Image] = [
-            PILImage.open(f).convert("L").resize(self.SIZE) for f in img_files
+            PILImage.open(f)
+            .convert("RGB" if self.ENABLE_RGB else "L")
+            .resize(self.SIZE)
+            for f in img_files
         ]
 
     @staticmethod
@@ -130,7 +147,13 @@ class CoordinateCNN(nn.Module):
 
         self.features = nn.Sequential(
             # First block - 32 filters
-            nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(
+                3 if CoordinateDataset.ENABLE_RGB else 1,
+                32,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+            ),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=2, stride=2),
             # Second block - 64 filters
@@ -149,10 +172,13 @@ class CoordinateCNN(nn.Module):
 
         self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(256 * 32 * 32, 512),
+            nn.Linear(
+                CoordinateDataset.SIZE[0] * CoordinateDataset.SIZE[1],
+                CoordinateDataset.SIZE[0],
+            ),
             nn.ReLU(inplace=True),
             nn.Dropout(0.5),
-            nn.Linear(512, 128),
+            nn.Linear(CoordinateDataset.SIZE[0], 128),
             nn.ReLU(inplace=True),
         )
 
@@ -379,6 +405,97 @@ def convert_to_detection_format_with_confidence(
     return {"boxes": boxes, "scores": scores, "labels": labels}
 
 
+def evaluate_model(
+    model, val_loader, device, criterion, description: str = "Validation"
+) -> dict[str, float]:
+    """
+    Evaluate model and return detailed metrics.
+
+    Args:
+        model: Trained model
+        data_loader: DataLoader for evaluation
+        device: Device to run evaluation on
+        image_size: Image dimensions for mAP calculation
+    Returns:
+        Dictionary with evaluation metrics
+    """
+
+    # Validation phase
+    model.eval()
+    val_loss: float = 0.0
+    val_coord_loss: float = 0.0
+    val_conf_loss: float = 0.0
+
+    val_metric = MeanAveragePrecision(iou_thresholds=[0.5, 0.75])
+
+    with torch.no_grad():
+        val_pbar = tqdm(val_loader, desc=description)
+
+        for images, coords in val_pbar:
+            images = images.to(device)
+            coords = coords.to(device)
+
+            # Forward pass
+            pred_coords, pred_conf = model(images)
+            loss, coord_loss, conf_loss = criterion(pred_coords, pred_conf, coords)
+
+            # Update statistics
+            val_loss += loss.item() * images.size(0)
+            val_coord_loss += coord_loss.item() * images.size(0)
+            val_conf_loss += conf_loss.item() * images.size(0)
+
+            # Convert to detection format with confidence scores
+            batch_size = images.size(0)
+            preds = []
+            targets = []
+
+            for i in range(batch_size):
+                # For predictions, use the model's confidence
+                pred_dict = convert_to_detection_format_with_confidence(
+                    pred_coords[i : i + 1].cpu(),
+                    pred_conf[i : i + 1].cpu().squeeze(),
+                    CoordinateDataset.SIZE,
+                )
+                # For targets, use confidence of 1.0
+                target_dict = convert_to_detection_format(
+                    coords[i : i + 1].cpu(), CoordinateDataset.SIZE
+                )
+
+                preds.append(pred_dict)
+                targets.append(target_dict)
+
+            val_metric.update(preds, targets)
+
+            val_pbar.set_postfix(
+                {
+                    "loss": loss.item(),
+                    "coord": coord_loss.item(),
+                    "conf": conf_loss.item(),
+                }
+            )
+
+    # Calculate averages
+    val_loss = val_loss / len(val_loader.dataset)
+    val_coord_loss = val_coord_loss / len(val_loader.dataset)
+    val_conf_loss = val_conf_loss / len(val_loader.dataset)
+
+    # Calculate mAP metrics
+    val_results = val_metric.compute()
+    val_map: float = val_results["map"].item() * 100
+    val_map50: float = val_results["map_50"].item() * 100
+    val_map75: float = val_results["map_75"].item() * 100
+
+    # return metrics
+    return {
+        "val_loss": val_loss,
+        "val_coord_loss": val_coord_loss,
+        "val_conf_loss": val_conf_loss,
+        "val_map": val_map,
+        "val_map50": val_map50,
+        "val_map75": val_map75,
+    }
+
+
 def train_and_validate(
     device: torch.device,
     model: CoordinateCNN,
@@ -451,69 +568,19 @@ def train_and_validate(
         train_conf_loss = train_conf_loss / len(train_loader.dataset)
 
         # Validation phase
-        model.eval()
-        val_loss = 0.0
-        val_coord_loss = 0.0
-        val_conf_loss = 0.0
-
-        val_metric = MeanAveragePrecision(iou_thresholds=[0.5, 0.75])
-
-        with torch.no_grad():
-            val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Val]")
-
-            for images, coords in val_pbar:
-                images = images.to(device)
-                coords = coords.to(device)
-
-                # Forward pass
-                pred_coords, pred_conf = model(images)
-                loss, coord_loss, conf_loss = criterion(pred_coords, pred_conf, coords)
-
-                # Update statistics
-                val_loss += loss.item() * images.size(0)
-                val_coord_loss += coord_loss.item() * images.size(0)
-                val_conf_loss += conf_loss.item() * images.size(0)
-
-                # Convert to detection format with confidence scores
-                batch_size = images.size(0)
-                preds = []
-                targets = []
-
-                for i in range(batch_size):
-                    # For predictions, use the model's confidence
-                    pred_dict = convert_to_detection_format_with_confidence(
-                        pred_coords[i : i + 1].cpu(),
-                        pred_conf[i : i + 1].cpu().squeeze(),
-                        CoordinateDataset.SIZE,
-                    )
-                    # For targets, use confidence of 1.0
-                    target_dict = convert_to_detection_format(
-                        coords[i : i + 1].cpu(), CoordinateDataset.SIZE
-                    )
-
-                    preds.append(pred_dict)
-                    targets.append(target_dict)
-
-                val_metric.update(preds, targets)
-
-                val_pbar.set_postfix(
-                    {
-                        "loss": loss.item(),
-                        "coord": coord_loss.item(),
-                        "conf": conf_loss.item(),
-                    }
-                )
-
-        # Calculate averages
-        val_loss = val_loss / len(val_loader.dataset)
-        val_coord_loss = val_coord_loss / len(val_loader.dataset)
-        val_conf_loss = val_conf_loss / len(val_loader.dataset)
-
-        # Calculate mAP metrics
-        val_results = val_metric.compute()
-        val_map = val_results["map"].item() * 100
-        val_map50 = val_results["map_50"].item() * 100
-        val_map75 = val_results["map_75"].item() * 100
+        val_result: dict[str, float] = evaluate_model(
+            model,
+            val_loader,
+            device,
+            criterion,
+            description=f"Epoch {epoch+1}/{num_epochs} [Val]",
+        )
+        val_loss = val_result["val_loss"]
+        val_coord_loss = val_result["val_coord_loss"]
+        val_conf_loss = val_result["val_conf_loss"]
+        val_map = val_result["val_map"]
+        val_map50 = val_result["val_map50"]
+        val_map75 = val_result["val_map75"]
 
         # Update history
         history["train_loss"].append(train_loss)
@@ -544,7 +611,9 @@ def train_and_validate(
             print(f"New best mAP50: {best_map50:.2f}% - Model saved!")
         else:
             patience_counter += 1
-            print(f"No improvement in mAP50. Patience: {patience_counter}/{patience}")
+            print(
+                f"No improvement in mAP50. Current best mAP50: {best_map50:.2f} - Patience: {patience_counter}/{patience}"
+            )
 
             if patience_counter >= patience:
                 print(f"Early stopping triggered after {epoch+1} epochs!")
@@ -555,70 +624,6 @@ def train_and_validate(
         model.load_state_dict(best_model_state)
 
     return history
-
-
-def evaluate_model_map(
-    model, data_loader, device, image_size: tuple[int, int] = (512, 512)
-) -> dict:
-    """
-    Evaluate model and return detailed mAP metrics.
-
-    Args:
-        model: Trained model
-        data_loader: DataLoader for evaluation
-        device: Device to run evaluation on
-        image_size: Image dimensions for mAP calculation
-
-    Returns:
-        Dictionary with evaluation metrics
-    """
-    model.eval()
-
-    # Initialize metric
-    metric = MeanAveragePrecision(iou_thresholds=[0.5, 0.75])
-
-    with torch.no_grad():
-        for images, coords in tqdm(data_loader, desc="Evaluating"):
-            images = images.to(device)
-            coords = coords.to(device)
-
-            # FIXED: Get BOTH coordinates and confidence scores
-            pred_coords, pred_conf = model(images)
-
-            # Convert to detection format
-            batch_size = images.size(0)
-            preds = []
-            targets = []
-
-            for i in range(batch_size):
-                # FIXED: Use the model's confidence scores for predictions
-                pred_dict = convert_to_detection_format_with_confidence(
-                    pred_coords[i : i + 1].cpu(),
-                    pred_conf[i : i + 1].cpu().squeeze(),
-                    image_size,
-                )
-                target_dict = convert_to_detection_format(
-                    coords[i : i + 1].cpu(), image_size
-                )
-                preds.append(pred_dict)
-                targets.append(target_dict)
-
-            metric.update(preds, targets)
-
-    # Compute final metrics
-    results = metric.compute()
-
-    metrics = {
-        "mAP": results["map"].item() * 100,
-        "mAP50": results["map_50"].item() * 100,
-        "mAP75": results["map_75"].item() * 100,
-        "mAR@1": results["mar_1"].item() * 100,
-        "mAR@10": results["mar_10"].item() * 100,
-        "mAR@100": results["mar_100"].item() * 100,
-        "total_samples": len(data_loader.dataset),
-    }
-
-    return metrics
 
 
 def plot_training_history(history: dict):
@@ -739,7 +744,7 @@ def prediction_as_YOLO(
     model: torch.nn.Module,
 ) -> np.ndarray:
     # Load and transform the image
-    image = PILImage.open(image_path).convert("L")
+    image = PILImage.open(image_path).convert("RGB")
 
     # Transform the image
     transformed_image = CoordinateDataset.TRANSFORM(image)
