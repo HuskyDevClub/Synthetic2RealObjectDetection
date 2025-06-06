@@ -59,6 +59,34 @@ class CoordinateDataset(Dataset):
     # Define transformations (without normalization for images)
     TRANSFORM: transforms.Compose = transforms.Compose(__TRANSFORM_SEQUENCE)
 
+    # Update hyperparameters based on the model path
+    @classmethod
+    def update_hyperparameters(cls, path: str) -> None:
+        if not path.endswith(".pt"):
+            raise ValueError("Path must point to a .pt file")
+
+        # Extract filename to determine RGB
+        filename: str = os.path.basename(path)
+        cls.ENABLE_RGB = "rbg" in filename
+        if cls.ENABLE_RGB:
+            if len(cls.__TRANSFORM_SEQUENCE) == 3:
+                cls.__TRANSFORM_SEQUENCE.pop(0)  # Remove Grayscale if it exists
+        elif len(cls.__TRANSFORM_SEQUENCE) == 2:
+            cls.__TRANSFORM_SEQUENCE.insert(
+                0, transforms.Grayscale(num_output_channels=1)
+            )
+
+        # Extract width from filename (assumes format like "dataset_rbg_256.pt")
+        w: int = int(filename.strip(".pt").split("_")[-1])
+        cls.SIZE = (w, w)
+        cls.__TRANSFORM_SEQUENCE[-2] = transforms.Resize(cls.SIZE)
+
+        # Update the transformation
+        cls.TRANSFORM = transforms.Compose(cls.__TRANSFORM_SEQUENCE)
+
+        # Enable or disable transforms based on filename
+        cls.ENABLE_TRANSFORM_TRAIN = "light" not in filename
+
     def __init__(self, dataset_dir: str):
         """
         Args:
